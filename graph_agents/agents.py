@@ -10,8 +10,8 @@ DEVELOPMENT_PROMPT = (
     "when information is missing. Focus on concrete code, reasoning, and relevant "
     "validation. When workspace tools are available, inspect relevant files before "
     "proposing changes and cite the paths and line numbers returned by the tools. "
-    "Otherwise use only the supplied context. You return text proposals and cannot "
-    "edit files or run commands. Never claim changes were applied or tests passed. "
+    "Otherwise use only the supplied context. Only claim file changes confirmed by "
+    "successful write tools. You cannot run commands or tests; never claim tests passed. "
 )
 
 # Leading intent takes precedence: 'write tests for a bug' is testing, while
@@ -54,6 +54,7 @@ def classify_node(state: GraphState) -> dict:
         "draft": "",
         "review": "",
         "answer": None,
+        "changed_files": [],
         "steps": state.get("steps", []) + [f"classify -> routed to '{route}' agent"],
     }
 
@@ -72,11 +73,13 @@ def _request_context(state: GraphState) -> str:
 
 def planner_node(state: GraphState) -> dict:
     llm = get_llm(
+        profile="planning",
         workspace=state.get("workspace"),
         system_prompt=DEVELOPMENT_PROMPT + (
             "You are the development planner. Produce a short plan with acceptance "
             "criteria, the proposed approach, likely affected areas, and validation "
             "steps appropriate to the selected task. Do not invent repository files."
+            " Planning is read-only; leave implementation to the specialist."
         ),
         canned_fallback=(
             "[Stub planner] Clarify expected behavior, inspect the supplied context, "
@@ -122,13 +125,22 @@ def _specialist_node(state: GraphState, route: DevelopmentRoute) -> dict:
     instructions, fallback = SPECIALISTS[route]
     llm = get_llm(
         workspace=state.get("workspace"),
-        system_prompt=DEVELOPMENT_PROMPT + instructions,
+        allow_writes=bool(state.get("workspace")),
+        system_prompt=DEVELOPMENT_PROMPT + instructions + (
+            " A workspace is selected: implement the user's requested changes directly using "
+            "create_workspace_file and edit_workspace_file. Read existing files before editing. "
+            "Do not stop at a proposal when the user requested implementation. Preserve unrelated "
+            "work. For explanation or planning-only requests, provide an answer without edits. "
+            "Report actual changes, any incomplete work, and how to validate; tests are not executed."
+            if state.get("workspace") else " No workspace is selected; provide a proposal only."
+        ),
         canned_fallback=fallback,
     )
     draft = llm.invoke(f"{_request_context(state)}\n\nDevelopment plan:\n{state['plan']}")
     return {
         "draft": draft,
-        "steps": state["steps"] + [f"{route}_agent -> produced development proposal"],
+        "changed_files": getattr(llm, "changed_files", []),
+        "steps": state["steps"] + [f"{route}_agent -> completed development step"],
     }
 
 
@@ -167,13 +179,16 @@ def review_agent_node(state: GraphState) -> dict:
             "finding give its severity, evidence, impact, and a practical correction "
             "or validation step. Give file and line locations only when supplied. "
             "Explain architectural tradeoffs and coach the team toward a proportionate "
-            "solution. Return an advisory verdict (ready for implementation, changes "
+            "solution. Return an advisory verdict (ready for validation, changes "
             "requested, or insufficient context), blocking findings, non-blocking "
             "suggestions, and remaining validation. A verdict is based only on the "
             "provided evidence, never proof that code was executed or is safe to deploy. "
             "Do not invent findings; if no supported issues are found, say so and "
             "identify any validation gaps. If code is missing, explain what is needed "
             "for a concrete review."
+            " You have read-only tools. When a confirmed changed-files list is supplied, read "
+            "those files from the workspace and review their actual current contents. Changes "
+            "are already saved; distinguish applied changes from unimplemented suggestions."
         ),
         canned_fallback=(
             "[Stub staff engineer] Verdict: insufficient context (offline stub). "
@@ -185,14 +200,15 @@ def review_agent_node(state: GraphState) -> dict:
     review = llm.invoke(
         f"{_request_context(state)}\n\n"
         f"Development plan:\n{state.get('plan') or '(Review-only request.)'}\n\n"
-        f"Development proposal:\n{state.get('draft') or '(Review the supplied context directly.)'}"
+        f"Development result:\n{state.get('draft') or '(Review the supplied context directly.)'}\n\n"
+        f"Confirmed changed files:\n{state.get('changed_files') or '(No files changed.)'}"
     )
     if state["route"] == "review":
         answer = review
     else:
         answer = (
             f"Development plan:\n{state['plan']}\n\n"
-            f"Proposed solution:\n{state['draft']}\n\n"
+            f"Development result:\n{state['draft']}\n\n"
             f"Staff engineer review:\n{review}"
         )
     return {

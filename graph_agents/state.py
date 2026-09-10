@@ -16,7 +16,8 @@ class GraphState(_RequiredInput, total=False):
     """
 
     context: str  # Source code, logs, constraints, or repository notes.
-    workspace: str  # Selected codebase root for read-only inspection tools.
+    workspace: str  # Selected codebase root for inspection and specialist edits.
+    changed_files: List[dict]  # Confirmed filesystem changes, not model claims.
     route: Optional[DevelopmentRoute]
     plan: str
     draft: str

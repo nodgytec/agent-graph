@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from graph_agents.llm import StubLLM, get_llm
+from graph_agents.llm import StubLLM, get_llm, workspace_tool_budget
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -18,7 +18,9 @@ class EnvironmentTests(unittest.TestCase):
         environment = patch.dict(os.environ)
         environment.start()
         self.addCleanup(environment.stop)
-        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_WORKSPACE_ID", "ANTHROPIC_REVIEW_MODEL", "PYTHON_DOTENV_DISABLED"):
+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_WORKSPACE_ID", "ANTHROPIC_REVIEW_MODEL", "PYTHON_DOTENV_DISABLED",
+                    "WORKSPACE_INSPECTION_LIMIT", "ANTHROPIC_PLANNING_MAX_TOKENS",
+                    "ANTHROPIC_DEVELOPMENT_MAX_TOKENS", "ANTHROPIC_REVIEW_MAX_TOKENS"):
             os.environ.pop(key, None)
         # Never construct real API clients or send requests with test credentials.
         client = patch("langchain_anthropic.ChatAnthropic")
@@ -34,6 +36,38 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(self.client.call_count, 2)
         for call in self.client.call_args_list:
             self.assertEqual(call.kwargs["api_key"], "file-test-key")
+
+    def test_inspection_budget_loads_from_env_file_and_respects_session_override(self):
+        self.env_file.write_text("WORKSPACE_INSPECTION_LIMIT=48\n", encoding="utf-8")
+        get_llm("System", "Stub", workspace=self.env_file.parent)
+        self.assertEqual(workspace_tool_budget(), 48)
+        os.environ["WORKSPACE_INSPECTION_LIMIT"] = " 24 "
+        get_llm("System", "Stub", workspace=self.env_file.parent)
+        self.assertEqual(workspace_tool_budget(), 24)
+        os.environ["WORKSPACE_INSPECTION_LIMIT"] = " "
+        self.assertEqual(workspace_tool_budget(), 16)
+
+    def test_output_budgets_load_from_file_and_respect_overrides(self):
+        self.env_file.write_text(
+            "ANTHROPIC_API_KEY=test-key\nANTHROPIC_PLANNING_MAX_TOKENS=48000\n"
+            "ANTHROPIC_DEVELOPMENT_MAX_TOKENS=60000\nANTHROPIC_REVIEW_MAX_TOKENS=64000\n", encoding="utf-8",
+        )
+        for profile, expected in (("planning", 48000), ("development", 60000), ("review", 64000)):
+            get_llm("System", "Stub", profile=profile)
+            self.assertEqual(self.client.call_args.kwargs["max_tokens"], expected)
+        os.environ["ANTHROPIC_DEVELOPMENT_MAX_TOKENS"] = " 50000 "
+        get_llm("System", "Stub")
+        self.assertEqual(self.client.call_args.kwargs["max_tokens"], 50000)
+        os.environ["ANTHROPIC_DEVELOPMENT_MAX_TOKENS"] = " "
+        get_llm("System", "Stub")
+        self.assertEqual(self.client.call_args.kwargs["max_tokens"], 32768)
+
+    def test_invalid_output_budgets_fail_before_client_creation(self):
+        for value in ("0", "-1", "1.5", "lots"):
+            with self.subTest(value=value), patch.dict(os.environ, {"ANTHROPIC_DEVELOPMENT_MAX_TOKENS": value}):
+                with self.assertRaisesRegex(ValueError, "ANTHROPIC_DEVELOPMENT_MAX_TOKENS"):
+                    get_llm("System", "Stub")
+        self.client.assert_not_called()
 
     def test_existing_environment_takes_precedence(self):
         self.env_file.write_text(

@@ -10,6 +10,7 @@ from .agents import (
     testing_agent_node,
 )
 from .state import GraphState
+from .progress import track_agent
 
 
 def route_after_classify(state: GraphState) -> str:
@@ -27,13 +28,13 @@ def build_graph():
     """
     graph = StateGraph(GraphState)
 
-    graph.add_node("classify", classify_node)
-    graph.add_node("planner", planner_node)
-    graph.add_node("implement_agent", implementation_agent_node)
-    graph.add_node("debug_agent", debugging_agent_node)
-    graph.add_node("refactor_agent", refactoring_agent_node)
-    graph.add_node("test_agent", testing_agent_node)
-    graph.add_node("review_agent", review_agent_node)
+    for name, node in (
+        ("classify", classify_node), ("planner", planner_node),
+        ("implement_agent", implementation_agent_node), ("debug_agent", debugging_agent_node),
+        ("refactor_agent", refactoring_agent_node), ("test_agent", testing_agent_node),
+        ("review_agent", review_agent_node),
+    ):
+        graph.add_node(name, track_agent(name, node))
 
     graph.set_entry_point("classify")
     graph.add_conditional_edges(
