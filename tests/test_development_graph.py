@@ -133,9 +133,9 @@ class DevelopmentGraphTests(unittest.TestCase):
             self.assertIn("review_agent -> produced staff engineer review", output.getvalue())
             self.assertIn("Answer: Review result", output.getvalue())
 
-    def test_cli_without_arguments_runs_all_examples(self):
+    def test_cli_examples_flag_runs_all_examples(self):
         with (
-            patch("sys.argv", ["main.py"]),
+            patch("sys.argv", ["main.py", "--examples"]),
             patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
             main()
@@ -147,7 +147,11 @@ class DevelopmentGraphTests(unittest.TestCase):
     def test_cli_rejects_invalid_input_before_building_graph(self):
         with tempfile.TemporaryDirectory() as directory:
             missing = str(Path(directory) / "missing.py")
-            for arguments in ([" "], ["--context-file", missing], ["Review this", "--context-file", missing]):
+            for arguments in (
+                [" "], ["--context-file", missing], ["Review this", "--context-file", missing],
+                ["Review this", "--examples"], ["--examples", "--context-file", missing],
+                ["--examples", "--workspace", "."],
+            ):
                 with (
                     self.subTest(arguments=arguments),
                     patch("sys.argv", ["main.py", *arguments]),

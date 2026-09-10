@@ -16,6 +16,7 @@ class GraphState(_RequiredInput, total=False):
     """
 
     context: str  # Source code, logs, constraints, or repository notes.
+    workspace: str  # Selected codebase root for read-only inspection tools.
     route: Optional[DevelopmentRoute]
     plan: str
     draft: str

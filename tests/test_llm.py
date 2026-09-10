@@ -1,6 +1,8 @@
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import anthropic
@@ -14,14 +16,18 @@ class ModelProfileTests(unittest.TestCase):
     def setUp(self):
         environment = patch.dict(os.environ, {
             "ANTHROPIC_API_KEY": "test-key",
+            "ANTHROPIC_WORKSPACE_ID": "",
             "ANTHROPIC_REVIEW_MODEL": "",
         })
         environment.start()
         self.addCleanup(environment.stop)
         self.requests = []
+        self.workspace_headers = []
         self.answer = "Review findings."
         self.stop_reason = "end_turn"
         self.api_error = False
+        self.api_error_message = "Model unavailable"
+        self.next_tool_call = None
         # Intercept HTTP, exercising the real LangChain/Anthropic request and
         # streaming response adapters without network access or paid inference.
         transport = patch("httpx.Client.send", side_effect=self.respond)
@@ -31,10 +37,11 @@ class ModelProfileTests(unittest.TestCase):
     def respond(self, request, **kwargs):
         payload = json.loads(request.content)
         self.requests.append(payload)
+        self.workspace_headers.append(request.headers.get("anthropic-workspace-id"))
         if self.api_error:
             return httpx.Response(400, request=request, json={
                 "type": "error",
-                "error": {"type": "invalid_request_error", "message": "Model unavailable"},
+                "error": {"type": "invalid_request_error", "message": self.api_error_message},
             })
         message = {
             "id": "msg_test", "type": "message", "role": "assistant",
@@ -42,25 +49,35 @@ class ModelProfileTests(unittest.TestCase):
             "stop_reason": None, "stop_sequence": None,
             "usage": {"input_tokens": 10, "output_tokens": 1},
         }
+        answer_blocks = [{"type": "text", "text": self.answer}] if self.answer else []
+        stop_reason = self.stop_reason
+        if self.next_tool_call is not None:
+            answer_blocks = [self.next_tool_call]
+            self.next_tool_call = None
+            stop_reason = "tool_use"
         if not payload.get("stream"):
-            message.update(content=[{"type": "text", "text": self.answer}], stop_reason=self.stop_reason)
+            message.update(content=answer_blocks, stop_reason=stop_reason)
             return httpx.Response(200, request=request, json=message)
 
         events = [{"type": "message_start", "message": message}]
         blocks = [{"type": "thinking", "thinking": "Internal reasoning", "signature": "test-signature"}]
-        if self.answer:
-            blocks.append({"type": "text", "text": self.answer})
+        blocks.extend(answer_blocks)
         for index, block in enumerate(blocks):
             field = block["type"]
-            initial = {**block, field: ""}
+            if field == "tool_use":
+                initial = {**block, "input": {}}
+                delta = {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}
+            else:
+                initial = {**block, field: ""}
+                delta = {"type": f"{field}_delta", field: block[field]}
             events.extend([
                 {"type": "content_block_start", "index": index, "content_block": initial},
                 {"type": "content_block_delta", "index": index,
-                 "delta": {"type": f"{field}_delta", field: block[field]}},
+                 "delta": delta},
                 {"type": "content_block_stop", "index": index},
             ])
         events.extend([
-            {"type": "message_delta", "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
+            {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None},
              "usage": {"output_tokens": 100}},
             {"type": "message_stop"},
         ])
@@ -111,6 +128,50 @@ class ModelProfileTests(unittest.TestCase):
             get_llm("Reviewer", "Stub", profile="review").invoke("Request")
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.requests[0]["model"], "claude-fable-5-1")
+
+    def test_account_workspace_header_reaches_all_agents_with_a_local_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"ANTHROPIC_WORKSPACE_ID": " wrkspc_account_test "}):
+                build_graph().invoke({"query": "Implement pagination", "workspace": directory})
+        self.assertEqual(self.workspace_headers, ["wrkspc_account_test"] * 3)
+
+    def test_blank_account_workspace_omits_header_for_scoped_keys(self):
+        for value in ("", "  "):
+            with patch.dict(os.environ, {"ANTHROPIC_WORKSPACE_ID": value}):
+                for profile in ("development", "review"):
+                    get_llm("System", "Stub", profile=profile).invoke("Request")
+        self.assertEqual(self.workspace_headers, [None] * 4)
+
+    def test_missing_workspace_header_error_explains_the_required_setting(self):
+        self.api_error = True
+        self.api_error_message = "This API key is not scoped to a workspace; include the anthropic-workspace-id header."
+        with self.assertRaisesRegex(RuntimeError, "ANTHROPIC_WORKSPACE_ID") as error:
+            get_llm("System", "Stub").invoke("Request")
+        self.assertIn("local /workspace folder is a separate setting", str(error.exception))
+
+    def test_workspace_tools_round_trip_through_both_provider_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "main.py").write_text("def answer(): return 42\n", encoding="utf-8")
+            for profile in ("development", "review"):
+                with self.subTest(profile=profile):
+                    self.requests.clear()
+                    self.workspace_headers.clear()
+                    self.next_tool_call = {
+                        "type": "tool_use", "id": "read_call", "name": "read_workspace_file",
+                        "input": {"path": "main.py"},
+                    }
+                    with patch.dict(os.environ, {"ANTHROPIC_WORKSPACE_ID": "wrkspc_tool_test"}):
+                        answer = get_llm("Inspect the code", "Stub", profile=profile, workspace=directory).invoke("Review main.py")
+                    self.assertEqual(answer, self.answer)
+                    self.assertEqual(len(self.requests), 2)
+                    self.assertEqual(self.workspace_headers, ["wrkspc_tool_test", "wrkspc_tool_test"])
+                    self.assertEqual([tool["name"] for tool in self.requests[0]["tools"]], [
+                        "list_workspace_files", "read_workspace_file",
+                    ])
+                    result = self.requests[1]["messages"][-1]["content"][0]
+                    self.assertEqual(result["type"], "tool_result")
+                    self.assertEqual(result["tool_use_id"], "read_call")
+                    self.assertIn("1: def answer(): return 42", json.dumps(result["content"]))
 
 
 if __name__ == "__main__":

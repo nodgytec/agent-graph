@@ -18,7 +18,7 @@ class EnvironmentTests(unittest.TestCase):
         environment = patch.dict(os.environ)
         environment.start()
         self.addCleanup(environment.stop)
-        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_REVIEW_MODEL", "PYTHON_DOTENV_DISABLED"):
+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_WORKSPACE_ID", "ANTHROPIC_REVIEW_MODEL", "PYTHON_DOTENV_DISABLED"):
             os.environ.pop(key, None)
         # Never construct real API clients or send requests with test credentials.
         client = patch("langchain_anthropic.ChatAnthropic")
@@ -36,10 +36,24 @@ class EnvironmentTests(unittest.TestCase):
             self.assertEqual(call.kwargs["api_key"], "file-test-key")
 
     def test_existing_environment_takes_precedence(self):
-        self.env_file.write_text("ANTHROPIC_API_KEY=file-test-key\n", encoding="utf-8")
+        self.env_file.write_text(
+            "ANTHROPIC_API_KEY=file-test-key\nANTHROPIC_WORKSPACE_ID=wrkspc_file\n", encoding="utf-8",
+        )
         os.environ["ANTHROPIC_API_KEY"] = "session-test-key"
+        os.environ["ANTHROPIC_WORKSPACE_ID"] = "wrkspc_session"
         get_llm("System", "Stub")
         self.assertEqual(self.client.call_args.kwargs["api_key"], "session-test-key")
+        self.assertEqual(self.client.call_args.kwargs["default_headers"], {"anthropic-workspace-id": "wrkspc_session"})
+
+    def test_file_supplies_account_workspace_header_to_both_profiles(self):
+        self.env_file.write_text(
+            'ANTHROPIC_API_KEY=file-test-key\nANTHROPIC_WORKSPACE_ID=" wrkspc_from_file "\n', encoding="utf-8",
+        )
+        for profile in ("development", "review"):
+            get_llm("System", "Stub", profile=profile)
+        self.assertEqual(self.client.call_count, 2)
+        for call in self.client.call_args_list:
+            self.assertEqual(call.kwargs["default_headers"], {"anthropic-workspace-id": "wrkspc_from_file"})
 
     def test_explicit_empty_environment_keeps_both_profiles_offline(self):
         self.env_file.write_text("ANTHROPIC_API_KEY=file-test-key\n", encoding="utf-8")
